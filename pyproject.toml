@@ -1,0 +1,15 @@
+[build-system]
+  requires = ["setuptools", "wheel"]
+  build-backend = "setuptools.backends._legacy:_Backend"
+
+  [project]
+  name = "financial-news-summarizer"
+  version = "0.1.0"
+  description = "AI-driven financial-news-summarizer"
+  requires-python = ">= 3.11"
+  authors = [
+      {name = "Kai", email = "kwu531@email.com"}
+  ]
+
+  [tool.pytest.ini_options]
+  testpaths = ["tests"]
