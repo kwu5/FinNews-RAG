@@ -1,3 +1,4 @@
 Python-dotenv >= 1.0,<2         #Loads environment variables from .env files into os.environ
 pydantic >= 2.7,<3              #Data validation library (also used by FastAPI for request/response models)
 pydantic-settings  >= 2.3,<3    #Extension of Pydantic for loading settings from environment variables
+requests ==2.31.0
