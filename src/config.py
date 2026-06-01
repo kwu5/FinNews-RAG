@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
     MAX_ARTICLES_PER_DAY: int = 30
     SIMILARITY_THRESHOLD: float = 0.85
+    CHUNK_SIZE_TOKENS: int = 256      # all-MiniLM-L6-v2's truncation cap; eval axis in Ship H
+    CHUNK_OVERLAP_TOKENS: int = 38    # ~15% of chunk size; tokens carried into the next chunk
     DAILY_RUN_HOUR: int = 18
     OUTPUT_DIR: str = "./output"
     FEEDS_CONFIG_PATH: str = "./config/feeds.yaml"

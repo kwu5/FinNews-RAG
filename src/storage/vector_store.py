@@ -10,15 +10,21 @@ class VectorStore:
         self.financial_news_collection = self.chroma_client.get_or_create_collection(name='financial_news')
 
 
-    def add_articles(self, articles: List[Dict], embeddings: list):
-        ids, documents, metadatas= [], [], []
-        for a in articles:
-            ids.append(a["url"])
-            documents.append(a["content"])
+    def add_chunks(self, chunks: List[Dict], embeddings: list):
+        # One ChromaDB entry per chunk. id = "{article_id}:{chunk_index}" so the
+        # eval harness (Ship F) can map a retrieved chunk back to its source row.
+        # Metadata can't hold None, so coerce missing optional fields to "".
+        ids, documents, metadatas = [], [], []
+        for c in chunks:
+            ids.append(f"{c['article_id']}:{c['chunk_index']}")
+            documents.append(c["text"])
             metadatas.append({
-                "title": a.get("title", ""),
-                "source": a.get("source", ""),
-                "published_at": a.get("published_at", ""),
+                "article_id": c["article_id"],
+                "chunk_index": c["chunk_index"],
+                "title": c.get("title") or "",
+                "source": c.get("source") or "",
+                "url": c.get("url") or "",
+                "published_at": c.get("published_at") or "",
             })
         self.financial_news_collection.upsert(
             ids=ids,
@@ -44,24 +50,24 @@ if __name__ == '__main__':
     vector_store = VectorStore(settings)
     embedding_gen = EmbeddingGenerator(settings)
 
-    # Create fake article dicts to test add_articles
-    fake_articles = [
-        {"title": "Fed Raises Interest Rates by 0.25%", "description": "Federal Reserve raises rates",
-         "content": "The Federal Reserve raised interest rates by 25 basis points on Wednesday, signaling more hikes ahead.",
-         "url": "https://example.com/fed-rates", "source": "Reuters", "published_at": "2026-04-14", "fetched_at": "2026-04-14"},
-        {"title": "Apple Reports Record Q2 Earnings", "description": "Apple beats expectations",
-         "content": "Apple Inc reported record quarterly revenue of $95 billion, driven by strong iPhone sales.",
-         "url": "https://example.com/apple-earnings", "source": "CNBC", "published_at": "2026-04-14", "fetched_at": "2026-04-14"},
-        {"title": "Bitcoin Surges Past $70,000", "description": "Crypto rally continues",
-         "content": "Bitcoin surged past $70,000 for the first time as institutional investors increased their holdings.",
-         "url": "https://example.com/bitcoin-surge", "source": "Yahoo Finance", "published_at": "2026-04-14", "fetched_at": "2026-04-14"},
+    # Create fake chunk dicts to test add_chunks (shape matches chunker output)
+    fake_chunks = [
+        {"chunk_index": 0, "article_id": 1, "title": "Fed Raises Interest Rates by 0.25%",
+         "text": "The Federal Reserve raised interest rates by 25 basis points on Wednesday, signaling more hikes ahead.",
+         "url": "https://example.com/fed-rates", "source": "Reuters", "published_at": "2026-04-14"},
+        {"chunk_index": 0, "article_id": 2, "title": "Apple Reports Record Q2 Earnings",
+         "text": "Apple Inc reported record quarterly revenue of $95 billion, driven by strong iPhone sales.",
+         "url": "https://example.com/apple-earnings", "source": "CNBC", "published_at": "2026-04-14"},
+        {"chunk_index": 0, "article_id": 3, "title": "Bitcoin Surges Past $70,000",
+         "text": "Bitcoin surged past $70,000 for the first time as institutional investors increased their holdings.",
+         "url": "https://example.com/bitcoin-surge", "source": "Yahoo Finance", "published_at": "2026-04-14"},
     ]
 
-    # Generate embeddings and add articles
-    texts = [f"{a['title']} {a['description']}" for a in fake_articles]
+    # Generate embeddings (over chunk text) and add chunks
+    texts = [c["text"] for c in fake_chunks]
     embeddings = embedding_gen.generate_embeddings(texts).tolist()
-    vector_store.add_articles(fake_articles, embeddings)
-    print(f"Added {len(fake_articles)} articles to vector store")
+    vector_store.add_chunks(fake_chunks, embeddings)
+    print(f"Added {len(fake_chunks)} chunks to vector store")
 
     # Search for similar articles using a query
     query = "cryptocurrency price rally"

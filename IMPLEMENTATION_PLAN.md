@@ -1,6 +1,5 @@
 # Implementation Plan — FinNews-RAG (Project B)
 
-**Plan revised:** 2026-05-20
 **Direction:** Evolve the working MVP into **FinNews-RAG** — a retrieval-augmented
 financial-news Q&A system whose headline differentiator is a **self-evaluation
 harness** (retrieval precision/recall, faithfulness, latency/cost across configs).
@@ -101,92 +100,92 @@ class GroundedAnswer(BaseModel):
 
 The daily-briefing structured model is unchanged from the MVP.
 
-## Roadmap — 3-day ships
+## Roadmap — ordered ships
 
-| Ship | Dates | Focus | Status |
-|---|---|---|---|
-| A | 2026-05-20 → 05-22 | Ingestion overhaul — RSS-first, full-text extraction, source health | Done |
-| B | 2026-05-23 → 05-25 | Dedup Stages 1–2 (URL canon + content hash); wipe + recreate DB | **Current** |
-| C | 2026-05-26 → 05-28 | Chunking layer + chunk-level embeddings indexed in ChromaDB | Planned |
-| D | 2026-05-29 → 05-31 | Retriever + grounded cited Q&A; Streamlit skeleton | Planned |
-| E | 2026-06-01 → 06-03 | Labeled test set (50–100 query/relevant-doc pairs) | Planned |
-| F | 2026-06-04 → 06-06 | Eval harness pt.1 — retrieval precision/recall + latency/cost | Planned |
-| G | 2026-06-07 → 06-09 | Eval harness pt.2 — RAGAS faithfulness + answer-relevance | Planned |
-| H | 2026-06-10 → 06-12 | Multi-config comparison runner + written findings | Planned |
-| I | 2026-06-13 → 06-15 | Streamlit polish + README finalize; stretch: signal extraction | Planned |
+Scheduling lives in `doc/june-weekly-schedule.md`, not here. This table is order
++ status only.
 
-**Cadence rule:** at each 3-day boundary, re-read this file, adjust the table if
-the previous ship slipped, and rewrite only the next ship's detail section to full
-resolution. Keep one ship detailed at a time.
+| Ship | Focus | Status |
+|---|---|---|
+| A | Ingestion overhaul — RSS-first, full-text extraction, source health | Done |
+| B | Dedup Stages 1–2 (URL canon + content hash); wipe + recreate DB | Done |
+| C | Chunking layer + chunk-level embeddings indexed in ChromaDB | **Current** |
+| D | Retriever + grounded cited Q&A; Streamlit skeleton | Planned |
+| E | Labeled test set (50–100 query/relevant-doc pairs) | Planned |
+| F | Eval harness pt.1 — retrieval precision/recall + latency/cost | Planned |
+| G | Eval harness pt.2 — RAGAS faithfulness + answer-relevance | Planned |
+| H | Multi-config comparison runner + written findings | Planned |
+| I | Streamlit polish + README finalize; stretch: signal extraction | Planned |
 
-### Ship B — Dedup Stages 1–2 + DB rebuild (CURRENT)
+**Cadence rule:** at each ship boundary, re-read this file and rewrite only the
+next ship's detail section to full resolution. Keep one ship detailed at a time.
+Scheduling is tracked separately in `doc/june-weekly-schedule.md`.
 
-**Goal:** Insert two cheap pre-embedding dedup stages — canonical URL and
-content hash — so the existing similarity dedup (now Stage 3) only sees
-survivors. Stages 1–2 are also enforced at the DB layer via UNIQUE constraints,
-which catches cross-day duplicates (syndicated wire copy, re-publishes) that
-in-batch dedup can't see. Wipe and recreate `data/news.db` to add the new
-columns — no Alembic. `output/*.md` is preserved.
+### Ship C — Chunking layer + chunk-level ChromaDB (CURRENT)
 
-**Why two stages before the embedding stage?** They're effectively free,
-deterministic, and they shrink the candidate set before we pay for embeddings.
-URL canonicalization catches the same article reached via different tracking
-params; content hashing catches identical text published under different URLs
-(wire syndication).
+**Full detail:** `doc/ship-c-chunking.md` (this section is the master-plan
+summary; the doc is the working copy with watch-outs).
+
+**Goal:** Replace article-level embeddings with chunk-level ones so retrieval
+(Ship D) operates on ~paragraph-sized passages instead of whole articles. Index
+each chunk in ChromaDB keyed `{article_id}:{chunk_index}`, carrying `article_id`
+in metadata so the eval harness (Ship F) can map a retrieved chunk back to its
+source article.
+
+**Why now:** Retrieval quality is the foundation everything downstream sits on.
+Whole-article embeddings dilute the signal — a query about one earnings figure
+shouldn't have to match against a 1,500-word article vector. This is also where
+the `indexed` flag (added in Ship B) finally gets used.
+
+**Resolved up front:**
+- The daily briefing does NOT depend on ChromaDB — it summarizes the in-memory
+  `articles` dicts directly. Today's article-level embeddings are write-only
+  (nothing reads them back; dedup Stage 3 embeds internally). So the chunk-level
+  conversion breaks nothing in the briefing path — no dual embedding scheme.
+- `all-MiniLM-L6-v2` truncates at 256 tokens, so ~256-token chunks match the
+  model's actual capacity rather than being an arbitrary choice.
 
 #### Tasks
 
-- [ ] **Schema additions** in `src/storage/database.py` — add to `Article`:
-      - `canonical_url: String, unique=True, nullable=False`
-      - `content_hash: String, unique=True, nullable=False`
-      - `extraction_method: String, nullable=True` (already populated by the
-        RSS reader; promote it from dict-only to a real column)
-      - `indexed: Boolean, default=False` (chunked + embedded into ChromaDB —
-        consumed in Ship C, defined now to avoid a second DB wipe)
-- [ ] **New module `src/processing/url_canon.py`** — `canonicalize_url(url: str) -> str`:
-      lowercase scheme + host, strip default ports, drop fragments, strip
-      tracking params (`utm_*`, `fbclid`, `gclid`, `mc_*`, `ref`, `source`,
-      `_hsenc`, `_hsmi`), normalize trailing slash. Unit-test with feed-shaped
-      fixtures.
-- [ ] **New module `src/processing/content_hash.py`** —
-      `compute_content_hash(article: dict) -> str`: sha256 over normalized
-      `title + "\n" + content` (lowercase, collapse whitespace, strip
-      non-alphanumeric). Unit-test that paraphrases hash differently and that
-      whitespace/case variations hash the same.
-- [ ] **Wire population into the pipeline** (`src/pipeline.py`) — after the
-      RSS/WNA fetch, before dedup, set `canonical_url` and `content_hash` on
-      each article dict.
-- [ ] **Stage the deduplicator** — refactor `Deduplicator` to run:
-      Stage 1 (canonical_url, in-batch) → Stage 2 (content_hash, in-batch) →
-      Stage 3 (existing cosine similarity). Log per-stage drop counts on one
-      summary line.
-- [ ] **DB-layer dedup against history** — `db.save_articles` should also
-      catch cross-run duplicates: skip when either `canonical_url` or
-      `content_hash` already exists. Cleaner than relying on UNIQUE-constraint
-      exceptions.
-- [ ] **Wipe + recreate** — instruct user to `rm data/news.db`; Database
-      constructor's `create_all` rebuilds with the new schema. Confirm
-      `output/*.md` untouched.
-- [ ] **Tests** — `tests/test_processing.py` unit tests for `canonicalize_url`
-      and `compute_content_hash`; end-to-end check that obvious dupes get
-      culled (e.g. inject a known wire-copy pair).
-- [ ] **Smoke test** — run the pipeline twice on the same day. First run:
-      log shows per-stage drop counts. Second run: zero re-saves of Run-1
-      articles. New rows from high-cadence feeds (e.g. Yahoo publishing during
-      the gap between runs) are expected and fine — what must NOT happen is
-      that a row already in the DB gets re-inserted under a different
-      canonical_url or content_hash. `tests/smoke_ship_b.py` checks this by
-      flagging "twin" pairs (same source + matching title prefix).
+- [ ] **Config** (`src/config.py`) — add `CHUNK_SIZE_TOKENS: int = 256` and
+      `CHUNK_OVERLAP_TOKENS: int = 38` (~15%); both become eval axes in Ship H.
+- [ ] **New module `src/rag/chunker.py`** —
+      `chunk_article(article: dict, chunk_size: int, overlap: int) -> list[dict]`.
+      Chunk dict: `{chunk_index, text, article_id, title, source, url,
+      published_at}`. Count tokens with the embedding model's tokenizer; short
+      articles → one chunk; sequential `chunk_index` from 0; overlap carries
+      trailing tokens forward.
+- [ ] **Convert `vector_store.py`** — replace `add_articles` with
+      `add_chunks(chunks, embeddings)`: id `f"{article_id}:{chunk_index}"`,
+      document = chunk text, metadata = `article_id / chunk_index / title /
+      source / url / published_at`. `search_similar` unchanged (now returns
+      chunk hits).
+- [ ] **Database accessors** (`src/storage/database.py`) — add
+      `get_unindexed_articles()` (`indexed == False`) and
+      `mark_indexed(article_ids)`. Chunk IDs need the autoincrement `id`, only
+      available after `save_articles`.
+- [ ] **Rewire pipeline** (`src/pipeline.py`) — replace the article-level embed
+      block with: `save_articles` → `get_unindexed_articles()` → chunk → embed
+      chunks → `add_chunks` → `mark_indexed`. Briefing step untouched.
+- [ ] **Reset ChromaDB** — delete `data/chroma/` (stale URL-keyed article-level
+      entries) so it rebuilds chunk-level. SQLite is NOT wiped; existing rows
+      have `indexed=False` so the first run re-chunks the back catalog.
+- [ ] **Tests** — chunker unit tests (short → 1 chunk; long → N with correct
+      overlap + sequential indices; metadata carried).
+- [ ] **Smoke test** (`tests/smoke_ship_c.py`) — ChromaDB count > article count;
+      IDs match `{int}:{int}`; every chunk carries `article_id`; second same-day
+      run does not re-index.
 
-**Done when:** a fresh DB rebuilds cleanly with `canonical_url` + `content_hash`
-+ `extraction_method` + `indexed`; pipeline logs show per-stage dedup drop
-counts; `tests/smoke_ship_b.py` reports zero twins on a same-day second run;
-`output/*.md` preserved from before the wipe.
+**Done when:** ChromaDB holds chunk-level entries with `article_id` in metadata;
+the `indexed` flag flips and gates re-runs; `search_similar` returns passage
+hits; the daily briefing still generates unchanged.
 
-**Deferred to later ships:** the `indexed` column gets *used* in Ship C (only
-re-chunk articles where `indexed = False`). Stage 3 (embedding similarity)
-stays in-batch — checking it against history would mean loading all prior
-embeddings, which we'll get for free once Ship C indexes chunks in ChromaDB.
+**Watch-outs:** `get_unindexed_articles()` must run *after* `save_articles`
+(chunk IDs need the DB `id`); re-run safety relies on `mark_indexed` committing,
+not on ChromaDB upsert idempotency.
+
+**Deferred to Ship D:** retriever wrapper over `search_similar` (query embed +
+top-k), the `GroundedAnswer` schema, cited-answer generation, Streamlit skeleton.
 
 ## Risk register
 

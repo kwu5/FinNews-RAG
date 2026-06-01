@@ -8,6 +8,7 @@ from src.processing.content_hash import compute_content_hash
 from src.processing.embeddings import EmbeddingGenerator
 from src.processing.deduplicator import Deduplicator
 from src.processing.url_canon import canonicalize_url
+from src.rag.chunker import chunk_article
 from src.storage.database import Database
 from src.storage.vector_store import VectorStore
 from src.summarization.llm_client import LLMClient
@@ -94,10 +95,37 @@ def run_pipeline() -> tuple[str, int]:
     # 4. Persist to SQL (skips existing URLs)
     db.save_articles(articles)
 
-    # 5. Generate embeddings and push to ChromaDB
-    texts = [f"{a['title']} {a.get('description', '')}" for a in articles]
-    embeddings = embedder.generate_embeddings(texts).tolist()
-    vstore.add_articles(articles, embeddings)
+    # 5. Chunk + index newly-saved articles into ChromaDB (chunk-level).
+    #    MUST run after save_articles — chunk ids need the SQLite autoincrement id.
+    #    get_unindexed_articles() returns ORM rows; chunk_article() wants dicts.
+    unindexed = db.get_unindexed_articles()
+    chunks = []
+    for row in unindexed:
+        article = {
+            "id": row.id,
+            "content": row.content,
+            "title": row.title,
+            "source": row.source,
+            "url": row.url,
+            "published_at": row.published_at,
+        }
+        chunks.extend(chunk_article(
+            article,
+            embedder.model.tokenizer,
+            settings.CHUNK_SIZE_TOKENS,
+            settings.CHUNK_OVERLAP_TOKENS,
+        ))
+    if chunks:
+        chunk_embeddings = embedder.generate_embeddings(
+            [c["text"] for c in chunks]
+        ).tolist()
+        vstore.add_chunks(chunks, chunk_embeddings)
+        logger.info(f"Indexed {len(chunks)} chunks from {len(unindexed)} articles")
+    # Mark every fetched article indexed — even one that yielded no chunks — so
+    # re-runs don't keep re-processing it. Relies on mark_indexed committing.
+    indexed_ids = [row.id for row in unindexed]
+    if indexed_ids:
+        db.mark_indexed(indexed_ids)
 
     # 6. LLM summary
     summary = llm.generate_summary(articles)

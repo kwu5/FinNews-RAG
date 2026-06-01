@@ -108,6 +108,26 @@ class Database:
             print(f"Error:{e}")
         finally:
             session.close()
+
+    #query where indexed = False — articles not yet chunked + embedded into ChromaDB
+    def get_unindexed_articles(self) -> list:
+        session = self.SessionLocal()
+        try:
+            return session.query(Article).filter_by(indexed=False).all()
+        finally:
+            session.close()
+
+    #update indexed = True. Must commit — re-run safety relies on this flag persisting.
+    def mark_indexed(self, article_ids:list) :
+        session = self.SessionLocal()
+        try:
+            session.query(Article).filter(Article.id.in_(article_ids)).update({"indexed":True})
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            print(f"Error:{e}")
+        finally:
+            session.close()
     
 
 
