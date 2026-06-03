@@ -109,8 +109,8 @@ Scheduling lives in `doc/june-weekly-schedule.md`, not here. This table is order
 |---|---|---|
 | A | Ingestion overhaul — RSS-first, full-text extraction, source health | Done |
 | B | Dedup Stages 1–2 (URL canon + content hash); wipe + recreate DB | Done |
-| C | Chunking layer + chunk-level embeddings indexed in ChromaDB | **Current** |
-| D | Retriever + grounded cited Q&A; Streamlit skeleton | Planned |
+| C | Chunking layer + chunk-level embeddings indexed in ChromaDB | **Done** |
+| D | Retriever + grounded cited Q&A; Streamlit skeleton | **Current** |
 | E | Labeled test set (50–100 query/relevant-doc pairs) | Planned |
 | F | Eval harness pt.1 — retrieval precision/recall + latency/cost | Planned |
 | G | Eval harness pt.2 — RAGAS faithfulness + answer-relevance | Planned |
@@ -121,7 +121,7 @@ Scheduling lives in `doc/june-weekly-schedule.md`, not here. This table is order
 next ship's detail section to full resolution. Keep one ship detailed at a time.
 Scheduling is tracked separately in `doc/june-weekly-schedule.md`.
 
-### Ship C — Chunking layer + chunk-level ChromaDB (CURRENT)
+### Ship C — Chunking layer + chunk-level ChromaDB (DONE)
 
 **Full detail:** `doc/ship-c-chunking.md` (this section is the master-plan
 summary; the doc is the working copy with watch-outs).
@@ -147,32 +147,32 @@ the `indexed` flag (added in Ship B) finally gets used.
 
 #### Tasks
 
-- [ ] **Config** (`src/config.py`) — add `CHUNK_SIZE_TOKENS: int = 256` and
+- [x] **Config** (`src/config.py`) — add `CHUNK_SIZE_TOKENS: int = 256` and
       `CHUNK_OVERLAP_TOKENS: int = 38` (~15%); both become eval axes in Ship H.
-- [ ] **New module `src/rag/chunker.py`** —
+- [x] **New module `src/rag/chunker.py`** —
       `chunk_article(article: dict, chunk_size: int, overlap: int) -> list[dict]`.
       Chunk dict: `{chunk_index, text, article_id, title, source, url,
       published_at}`. Count tokens with the embedding model's tokenizer; short
       articles → one chunk; sequential `chunk_index` from 0; overlap carries
       trailing tokens forward.
-- [ ] **Convert `vector_store.py`** — replace `add_articles` with
+- [x] **Convert `vector_store.py`** — replace `add_articles` with
       `add_chunks(chunks, embeddings)`: id `f"{article_id}:{chunk_index}"`,
       document = chunk text, metadata = `article_id / chunk_index / title /
       source / url / published_at`. `search_similar` unchanged (now returns
       chunk hits).
-- [ ] **Database accessors** (`src/storage/database.py`) — add
+- [x] **Database accessors** (`src/storage/database.py`) — add
       `get_unindexed_articles()` (`indexed == False`) and
       `mark_indexed(article_ids)`. Chunk IDs need the autoincrement `id`, only
       available after `save_articles`.
-- [ ] **Rewire pipeline** (`src/pipeline.py`) — replace the article-level embed
+- [x] **Rewire pipeline** (`src/pipeline.py`) — replace the article-level embed
       block with: `save_articles` → `get_unindexed_articles()` → chunk → embed
       chunks → `add_chunks` → `mark_indexed`. Briefing step untouched.
-- [ ] **Reset ChromaDB** — delete `data/chroma/` (stale URL-keyed article-level
+- [x] **Reset ChromaDB** — delete `data/chroma/` (stale URL-keyed article-level
       entries) so it rebuilds chunk-level. SQLite is NOT wiped; existing rows
       have `indexed=False` so the first run re-chunks the back catalog.
-- [ ] **Tests** — chunker unit tests (short → 1 chunk; long → N with correct
+- [x] **Tests** — chunker unit tests (short → 1 chunk; long → N with correct
       overlap + sequential indices; metadata carried).
-- [ ] **Smoke test** (`tests/smoke_ship_c.py`) — ChromaDB count > article count;
+- [x] **Smoke test** (`tests/smoke_ship_c.py`) — ChromaDB count > article count;
       IDs match `{int}:{int}`; every chunk carries `article_id`; second same-day
       run does not re-index.
 

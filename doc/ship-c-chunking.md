@@ -1,6 +1,6 @@
 # Ship C — Chunking layer + chunk-level ChromaDB
 
-**Status:** Current
+**Status:** Done (2026-06-01)
 **Drafted:** 2026-05-29
 **Parent plan:** `IMPLEMENTATION_PLAN.md` (roadmap ship C)
 **Predecessors:** Ship A (ingestion overhaul) ✅, Ship B (dedup Stages 1–2) ✅
@@ -36,41 +36,41 @@ flag (added in Ship B) finally gets used.
 
 ## Tasks
 
-- [ ] **Config** (`src/config.py`) — add `CHUNK_SIZE_TOKENS: int = 256` and
+- [x] **Config** (`src/config.py`) — add `CHUNK_SIZE_TOKENS: int = 256` and
       `CHUNK_OVERLAP_TOKENS: int = 38` (~15%). These become eval comparison axes
       in Ship H, so make them settings, not constants.
-- [ ] **New module `src/rag/chunker.py`** —
+- [x] **New module `src/rag/chunker.py`** —
       `chunk_article(article: dict, chunk_size: int, overlap: int) -> list[dict]`.
       Each returned chunk dict: `{chunk_index, text, article_id, title, source,
       url, published_at}`. Count tokens with the embedding model's own tokenizer
       (not word-splitting) for accuracy against the 256 cap. Short articles →
       one chunk; sequential `chunk_index` from 0; overlap carries trailing
       tokens into the next chunk.
-- [ ] **Convert `vector_store.py`** — replace `add_articles` with
+- [x] **Convert `vector_store.py`** — replace `add_articles` with
       `add_chunks(chunks: list[dict], embeddings: list)`: id =
       `f"{c['article_id']}:{c['chunk_index']}"`, document = chunk text,
       metadata = `article_id / chunk_index / title / source / url /
       published_at` (note: `url` and `article_id` are new to the metadata vs.
       today). Keep `search_similar` as-is — it now returns chunk hits.
-- [ ] **Database accessors** (`src/storage/database.py`) — add
+- [x] **Database accessors** (`src/storage/database.py`) — add
       `get_unindexed_articles() -> list` (`indexed == False`) and
       `mark_indexed(article_ids: list)`. Needed because chunk IDs require the
       SQLite autoincrement `id`, which only exists after `save_articles`.
-- [ ] **Rewire pipeline** (`src/pipeline.py`) — replace the article-level embed
+- [x] **Rewire pipeline** (`src/pipeline.py`) — replace the article-level embed
       block (lines 97–100) with: `save_articles` → `get_unindexed_articles()` →
       chunk each → embed all chunks → `add_chunks` → `mark_indexed`. Only
       unindexed articles get chunked, so re-runs don't duplicate. Briefing step
       stays untouched on the in-memory dicts.
-- [ ] **Reset ChromaDB** — the existing collection holds stale article-level
+- [x] **Reset ChromaDB** — the existing collection holds stale article-level
       entries keyed by URL. One-time: delete `data/chroma/` (or reset the
       collection) so it rebuilds chunk-level. SQLite is **not** wiped (the
       `indexed` column already exists from Ship B) — but every existing row has
       `indexed=False`, so the first run re-chunks the whole back catalog, which
       is what we want.
-- [ ] **Tests** (`tests/test_processing.py` or new `tests/test_chunker.py`) —
+- [x] **Tests** (`tests/test_processing.py` or new `tests/test_chunker.py`) —
       short article → exactly 1 chunk; long article → N chunks with correct
       overlap and sequential indices; metadata carried through.
-- [ ] **Smoke test** (`tests/smoke_ship_c.py`) — run pipeline; assert ChromaDB
+- [x] **Smoke test** (`tests/smoke_ship_c.py`) — run pipeline; assert ChromaDB
       count > article count, all IDs match `{int}:{int}`, every chunk has
       `article_id` in metadata; run a sample query and eyeball that hits are
       passage-sized. Second run on the same day → no re-indexing (indexed flag
