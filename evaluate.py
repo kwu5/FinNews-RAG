@@ -17,6 +17,7 @@ import dataclasses
 import json
 import logging
 import os
+import sys
 from datetime import datetime
 
 from src.config import Settings
@@ -234,6 +235,11 @@ def _run_generation(args, settings, testset, out_dir, components) -> None:
 
 
 def main() -> None:
+    # Windows console defaults to cp1252, which can't encode report chars like ≈;
+    # force UTF-8 so the printed Markdown matches what we write to disk.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
     parser = argparse.ArgumentParser(description="Ship F/G — score retrieval and generation against the test set.")
     parser.add_argument("--top-k", type=int, default=None, help="served depth (default RETRIEVAL_TOP_K)")
     parser.add_argument("--k-sweep", type=str, default="1,3,5,10", help="comma-separated k values (retrieval)")
