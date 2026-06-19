@@ -18,10 +18,43 @@ class GroundedLLMResponse(BaseModel):
     answered_from_context: bool   # False -> context didn't contain the answer
 
 
+# --- Ship G: LLM-judge structured-output schemas -------------------------------
+# Flat (parallel lists, no nested objects) for gpt-4o-mini structured-output
+# reliability — same reasoning as GroundedLLMResponse.
+
+class ClaimList(BaseModel):
+    """Faithfulness step 1: atomic factual claims decomposed from an answer."""
+    claims: List[str]
+
+
+class ClaimVerdicts(BaseModel):
+    """Faithfulness step 2: per-claim support verdicts, index-aligned to the
+    claims passed in (verdict[i] is for claim[i])."""
+    supported: List[bool]
+
+
+class CandidateQuestions(BaseModel):
+    """Answer-relevance step 1: questions the answer would directly respond to,
+    plus a flag for evasive/non-committal answers (which score 0)."""
+    questions: List[str]
+    noncommittal: bool
+
+
 class LLMClient:
     def __init__(self,setting: Settings):
         self.client = OpenAI(api_key= setting.OPENAI_API_KEY)
         self.model = setting.LLM_MODEL
+        # Ship G: running token totals across this client's calls (generation +
+        # judge), read by evaluate.py for the cost summary.
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+
+    def _track_usage(self, completion) -> None:
+        """Accumulate token usage off a chat-completions result (guards missing usage)."""
+        usage = getattr(completion, "usage", None)
+        if usage is not None:
+            self.total_prompt_tokens += usage.prompt_tokens
+            self.total_completion_tokens += usage.completion_tokens
     
     def generate_summary(self, articles: List[Dict]) -> None|str:
         formatted = []
@@ -88,6 +121,7 @@ class LLMClient:
             temperature=0,
             response_format=GroundedLLMResponse,
         )
+        self._track_usage(completion)
         parsed = completion.choices[0].message.parsed
         # parse() can return None if the model refused; surface a safe insufficient-context
         # result rather than letting qa.py dereference None.
@@ -98,6 +132,96 @@ class LLMClient:
                 answered_from_context=False,
             )
         return parsed
+
+    # --- Ship G: LLM-judge methods --------------------------------------------
+    # Each mirrors generate_grounded_answer: structured-output `parse`,
+    # temperature=0 (deterministic replay), None-guard, _track_usage.
+
+    def decompose_claims(self, answer: str) -> List[str]:
+        """Faithfulness step 1: break `answer` into atomic, self-contained factual
+        claims. Returns [] when the answer has no verifiable factual content (e.g.
+        an abstention) — the caller then excludes the row from the faithfulness mean.
+        """
+        system_prompt = (
+            "You break a financial-news answer into its atomic factual claims. "
+            "Each claim must be a single, self-contained statement that can be "
+            "verified true/false on its own (resolve pronouns; no compound claims). "
+            "Return ONLY claims that assert a fact. If the text asserts no verifiable "
+            "fact (e.g. it says it lacks information), return an empty list."
+        )
+        completion = self.client.beta.chat.completions.parse(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": answer},
+            ],
+            temperature=0,
+            response_format=ClaimList,
+        )
+        self._track_usage(completion)
+        parsed = completion.choices[0].message.parsed
+        return parsed.claims if parsed is not None else []
+
+    def verify_claims(self, context: str, claims: List[str]) -> List[bool]:
+        """Faithfulness step 2: decide, for each claim, whether it is supported by
+        `context` ALONE. One batched call; returns a bool list index-aligned to
+        `claims` (supported[i] is for claims[i]). Empty `claims` -> [].
+        """
+        if not claims:
+            return []
+        numbered = "\n".join(f"{i}. {c}" for i, c in enumerate(claims, start=1))
+        system_prompt = (
+            "You verify factual claims against a provided context. For EACH "
+            "numbered claim, decide whether it is directly supported by the context "
+            "ONLY (do not use outside knowledge). Return a `supported` list of "
+            "booleans, one per claim, in the SAME ORDER as the numbered claims."
+        )
+        user_prompt = f"Context:\n{context}\n\nClaims:\n{numbered}"
+        completion = self.client.beta.chat.completions.parse(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+            response_format=ClaimVerdicts,
+        )
+        self._track_usage(completion)
+        parsed = completion.choices[0].message.parsed
+        verdicts = parsed.supported if parsed is not None else []
+        # Length guard: a wrong-length list would misalign claims->verdicts. Pad a
+        # short list with False (missing verdict = unsupported) and truncate a long one.
+        if len(verdicts) != len(claims):
+            verdicts = (verdicts + [False] * len(claims))[: len(claims)]
+        return verdicts
+
+    def generate_candidate_questions(self, answer: str, n: int = 3) -> tuple[List[str], bool]:
+        """Answer-relevance step 1: generate `n` questions that `answer` would be a
+        direct response to, and flag whether the answer is non-committal/evasive.
+        Returns (questions, noncommittal). A refused parse -> ([], True) so the
+        caller scores relevance 0.
+        """
+        system_prompt = (
+            f"Given an answer, generate {n} distinct questions that the answer "
+            "would directly and fully address. Base the questions only on the "
+            "answer's content. Also set `noncommittal` to true if the answer is "
+            "evasive or says it lacks the information (e.g. 'I don't have enough "
+            "context'), otherwise false."
+        )
+        completion = self.client.beta.chat.completions.parse(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": answer},
+            ],
+            temperature=0,
+            response_format=CandidateQuestions,
+        )
+        self._track_usage(completion)
+        parsed = completion.choices[0].message.parsed
+        if parsed is None:
+            return [], True
+        return parsed.questions, parsed.noncommittal
 
     def classify_sentiment(self, text: str) -> str:
         response = self.client.chat.completions.create(
