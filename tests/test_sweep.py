@@ -17,11 +17,43 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.evaluation import sweep
+from src.evaluation.harness import EvalReport, GenerationReport
 from src.evaluation.sweep import SweepConfig, SweepRow
 
 
 def _cfg(chunk_size=256, top_k=5, overlap=38, model="all-MiniLM-L6-v2") -> SweepConfig:
     return SweepConfig(chunk_size=chunk_size, overlap=overlap, embedding_model=model, top_k=top_k)
+
+
+def _stub_eval_report(k_values) -> EvalReport:
+    """Cheap EvalReport with per_k_means populated for every swept k (run_sweep reads
+    per_k_means[config.top_k])."""
+    k_values = sorted(set(k_values))
+    return EvalReport(
+        top_k=5, k_values=list(k_values), n_in_domain=0, n_out_of_domain=0,
+        per_k_means={k: {"precision": 0.0, "recall": 0.0, "hit": 0.0} for k in k_values},
+        mean_mrr=0.0, abstention_accuracy=None, latency_p50_ms=1.0, latency_p95_ms=2.0,
+    )
+
+
+def _stub_gen_report(top_k) -> GenerationReport:
+    return GenerationReport(
+        top_k=top_k, n_in_domain=0, n_answered=0, n_skipped_unanswered=0,
+        mean_faithfulness=0.9, n_faithfulness=0, mean_answer_relevance=0.8,
+        n_answer_relevance=0, n_zero_relevance=0, prompt_tokens=0, completion_tokens=0,
+    )
+
+
+def _patch_harness(monkeypatch):
+    """Stub both eval halves so run_sweep's orchestration is what's under test."""
+    monkeypatch.setattr(
+        sweep, "evaluate_retrieval",
+        lambda testset, retriever, qa_engine, top_k, k_values: _stub_eval_report(k_values),
+    )
+    monkeypatch.setattr(
+        sweep, "evaluate_generation",
+        lambda testset, retriever, qa_engine, llm, embedder, top_k, cache, *a, **k: _stub_gen_report(top_k),
+    )
 
 
 class TestBuildGrid:
@@ -72,10 +104,7 @@ class TestRunSweep:
             return MagicMock(name="retriever")
 
         monkeypatch.setattr(sweep, "build_index", fake_build_index)
-        # TODO: also monkeypatch evaluate_retrieval / evaluate_generation to return
-        # cheap stub EvalReport / GenerationReport objects (no real harness run).
-        # monkeypatch.setattr(sweep, "evaluate_retrieval", lambda *a, **k: <stub>)
-        # monkeypatch.setattr(sweep, "evaluate_generation", lambda *a, **k: <stub>)
+        _patch_harness(monkeypatch)
 
         rows = sweep.run_sweep(
             testset=[], settings=MagicMock(), db=MagicMock(),
@@ -89,7 +118,7 @@ class TestRunSweep:
     def test_returns_one_row_per_config(self, monkeypatch):
         """One SweepRow per config (5), even though only 3 indexes were built."""
         monkeypatch.setattr(sweep, "build_index", lambda *a, **k: MagicMock())
-        # TODO: stub evaluate_retrieval / evaluate_generation as above.
+        _patch_harness(monkeypatch)
         grid = sweep.build_grid()
         rows = sweep.run_sweep(
             testset=[], settings=MagicMock(), db=MagicMock(),

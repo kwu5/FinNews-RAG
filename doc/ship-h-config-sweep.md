@@ -1,8 +1,9 @@
 # Ship H — Multi-config comparison runner + written findings
 
-**Status:** Building — detail drafted 2026-06-19; **both forks resolved 2026-06-26**
-(Fork A = hold MiniLM fixed; Fork B = defer union-pooling). Forks below kept for
-the reasoning record; the Decisions table is now fully locked.
+**Status:** DONE 2026-06-30 — sweep ran ($0.24, 5 configs / 3 builds); findings in
+`doc/ship-h-findings.md` (recommendation: keep defaults, results within judge noise).
+Both forks resolved 2026-06-26 (Fork A = hold MiniLM fixed; Fork B = defer
+union-pooling). Forks below kept for the reasoning record; the Decisions table is locked.
 **Parent plan:** `IMPLEMENTATION_PLAN.md` (roadmap ship H)
 **Predecessors:** Ship F (retrieval P/R + harness/CLI plumbing) ✅, Ship G
 (faithfulness + answer-relevance + judge cache) ✅
@@ -174,26 +175,20 @@ the standing caveat. **Open — your call.**
   name** (only matters if Fork A includes mpnet).
 - `load_testset` + the same `eval/testset.jsonl`, **held fixed** across all configs.
 
-## Tasks (built by the user)
+## Tasks
 
-- [ ] **Sweep config model** — a small dataclass / list enumerating the OFAT grid
-      (`chunk_size`, `overlap`, `embedding_model`, `top_k`) around the baseline.
-- [ ] **Per-config index builder** (`src/evaluation/sweep.py`) — read articles from
-      SQLite (read-only), chunk at the config's size, embed with the config's model,
-      write to `data/chroma_sweep/<slug>/`; return a `Retriever` bound to it. Skip
-      rebuild if the dir already exists (resumable).
-- [ ] **Sweep runner** — per config: build/point at its index → `evaluate_retrieval`
-      + `evaluate_generation` → collect one comparison row. Group by (chunk, model)
-      so re-index happens once per index; vary top_k innermost.
-- [ ] **CLI** — `evaluate.py --sweep` (reuse `--testset` / `--out`); writes
-      `output/eval/sweep_<date>.{md,json}` with the comparison table; prints a token
-      + estimated-$ total across the grid.
-- [ ] **Findings doc** (`doc/ship-h-findings.md`) — comparison table, recommended
-      config + why, caveats (pooling-bias on retrieval recall; judge variance;
-      single test set; OFAT not full grid).
-- [ ] **Tests** (`tests/test_sweep.py`) — config-grid generation; sweep aggregation
-      / ranking over **mocked** per-config harness results (no real index build, no
-      API).
+- [x] **Sweep config model** — `SweepConfig` + `build_grid` (OFAT, baseline emitted once).
+- [x] **Per-config index builder** (`src/evaluation/sweep.py`) — reads SQLite read-only,
+      chunks at the config's size, embeds with MiniLM, writes to
+      `data/chroma_sweep/<slug>/`; resumable (skips rebuild when collection count > 0).
+- [x] **Sweep runner** — `run_sweep`: groups by `index_slug`, builds once per index,
+      varies top_k innermost; one `SweepRow` per config.
+- [x] **CLI** — `evaluate.py --sweep`; writes `output/eval/sweep_eval_<date>.{md,json}`
+      with the ranked comparison table + grid-total token/cost.
+- [x] **Findings doc** (`doc/ship-h-findings.md`) — comparison table, recommendation
+      (keep defaults — within judge noise), per-axis trade-offs, caveats.
+- [x] **Tests** (`tests/test_sweep.py`) — grid shape / build-once-per-slug / ranking
+      over mocked harness results. 10/10 green.
 
 ## Done when
 

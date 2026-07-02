@@ -28,10 +28,12 @@ from src.evaluation.harness import (
     evaluate_retrieval,
 )
 from src.evaluation.judge_cache import JudgeCache
+from src.evaluation.sweep import build_grid, rank_rows, run_sweep
 from src.evaluation.testset import TESTSET_PATH, load_testset
 from src.processing.embeddings import EmbeddingGenerator
 from src.rag.qa import QAEngine
 from src.rag.retriever import Retriever
+from src.storage.database import Database
 from src.storage.vector_store import VectorStore
 from src.summarization.llm_client import LLMClient
 
@@ -234,6 +236,142 @@ def _run_generation(args, settings, testset, out_dir, components) -> None:
     print(f"\nWrote {md_path} and {json_path}")
 
 
+# --- Ship H: multi-config sweep -----------------------------------------------
+
+
+def _sweep_row_scalars(row) -> dict:
+    """JSON-friendly view of one SweepRow: the config + the pulled-out scalars.
+    Deliberately drops the nested EvalReport/GenerationReport — they're large,
+    per-query, and duplicated across configs sharing an index."""
+    return {
+        "label": row.config.label,
+        "index_slug": row.config.index_slug,
+        "chunk_size": row.config.chunk_size,
+        "overlap": row.config.overlap,
+        "embedding_model": row.config.embedding_model,
+        "top_k": row.config.top_k,
+        "precision": row.precision,
+        "recall": row.recall,
+        "hit_rate": row.hit_rate,
+        "mrr": row.mrr,
+        "faithfulness": row.faithfulness,
+        "answer_relevance": row.answer_relevance,
+        "latency_p50_ms": row.latency_p50_ms,
+    }
+
+
+def build_sweep_markdown(ranked, meta) -> str:
+    winner = ranked[0] if ranked else None
+    lines = [
+        f"# Config sweep (Ship H) — {meta.get('timestamp', '')}",
+        "",
+        f"**Test set:** `{meta.get('testset_path')}` "
+        f"({meta.get('n_configs')} configs over {meta.get('n_index_builds')} index build(s))  ",
+        f"**Embedding:** `{meta.get('embedding_model')}` (fixed — Fork A)  ·  "
+        f"**LLM judge:** `{meta.get('llm_model')}`  ",
+        "**Sweep:** OFAT around baseline chunk256 / top_k5 — one knob varied at a time.",
+        "",
+        "## Comparison (ranked best → worst)",
+        "",
+        "Ranked on the bias-free generation metrics (faithfulness, then answer-relevance), "
+        "with hit-rate / MRR as tie-breakers — see caveats.",
+        "",
+        "| rank | config | faithfulness | answer-rel | hit-rate | MRR | precision | latency p50 (ms) |",
+        "|------|--------|--------------|------------|----------|-----|-----------|------------------|",
+    ]
+    for i, row in enumerate(ranked, start=1):
+        is_baseline = row.config.chunk_size == 256 and row.config.top_k == 5
+        marks = []
+        if i == 1:
+            marks.append("winner")
+        if is_baseline:
+            marks.append("baseline")
+        suffix = f"  ← {', '.join(marks)}" if marks else ""
+        lines.append(
+            f"| {i} | {row.config.label} | {_fmt(row.faithfulness)} | "
+            f"{_fmt(row.answer_relevance)} | {_fmt(row.hit_rate)} | {_fmt(row.mrr)} | "
+            f"{_fmt(row.precision)} | {_fmt(row.latency_p50_ms, 1)} |{suffix}"
+        )
+    lines += ["", "## Recommended config", ""]
+    if winner is not None:
+        lines.append(
+            f"**{winner.config.label}** — faithfulness {_fmt(winner.faithfulness)}, "
+            f"answer-relevance {_fmt(winner.answer_relevance)}, hit-rate {_fmt(winner.hit_rate)}. "
+            "Confirm against the written findings (`doc/ship-h-findings.md`) before adopting; "
+            "if the top configs are within judge noise, keep the defaults per the risk register."
+        )
+    else:
+        lines.append("_No configs ran._")
+    lines += [
+        "",
+        "## Cost (whole grid)",
+        "",
+        f"Tokens: {meta.get('total_prompt_tokens')} in / {meta.get('total_completion_tokens')} out  ·  "
+        f"est. **${meta.get('total_cost_usd', 0.0):.4f}** total "
+        "(gpt-4o-mini list price; answer-generation + judge across every config)  ",
+        "_Judge calls are cached, so a re-run adds ≈ only answer-generation. Per-config marginal "
+        "cost isn't broken out — the LLM token counter is cumulative across the sweep._",
+        "",
+        "## Caveats",
+        "",
+        "- **Retrieval P/R/MRR carries pooling bias** — the test set was labeled from the baseline "
+        "config's pool, so non-baseline configs can't fully win on retrieval metrics. The ranking "
+        "leads on faithfulness / answer-relevance, which judge the answer against its own context "
+        "and are immune to this. Union-pooling is deferred to Ship I.",
+        "- **OFAT, not a full grid** — one knob varied at a time around the baseline; interactions "
+        "(e.g. chunk 512 only shining at top_k 10) aren't measured.",
+        "- **The judge is an LLM** — faithfulness / answer-relevance are estimates with their own "
+        "noise; the ranking treats gaps within ~0.01 (2 dp) as ties.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _run_sweep(args, settings, testset, out_dir) -> None:
+    # Sweep builds its OWN throwaway indexes per config, so it does not go through
+    # _build_components (which binds to canonical data/chroma/ and aborts if empty).
+    embedder = EmbeddingGenerator(settings)
+    llm = LLMClient(settings)
+    db = Database()
+    cache = JudgeCache(os.path.join(out_dir, "judge_cache.json"))
+
+    configs = build_grid()
+    n_builds = len({c.index_slug for c in configs})
+    logger.info(
+        "Sweeping %d configs over %d index build(s) on %d queries…",
+        len(configs), n_builds, len(testset),
+    )
+    rows = run_sweep(testset, settings, db, embedder, llm, cache, configs=configs)
+    ranked = rank_rows(rows)
+
+    prompt_tokens = getattr(llm, "total_prompt_tokens", 0)
+    completion_tokens = getattr(llm, "total_completion_tokens", 0)
+    meta = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "testset_path": args.testset,
+        "embedding_model": settings.EMBEDDING_MODEL,
+        "llm_model": settings.LLM_MODEL,
+        "n_configs": len(configs),
+        "n_index_builds": n_builds,
+        "total_prompt_tokens": prompt_tokens,
+        "total_completion_tokens": completion_tokens,
+        "total_cost_usd": _est_cost(prompt_tokens, completion_tokens),
+    }
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    md_path = os.path.join(out_dir, f"sweep_eval_{stamp}.md")
+    json_path = os.path.join(out_dir, f"sweep_eval_{stamp}.json")
+    markdown = build_sweep_markdown(ranked, meta)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(markdown)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"meta": meta, "rows": [_sweep_row_scalars(r) for r in ranked]},
+            f, ensure_ascii=False, indent=2,
+        )
+    print("\n" + markdown)
+    print(f"\nWrote {md_path} and {json_path}")
+
+
 def main() -> None:
     # Windows console defaults to cp1252, which can't encode report chars like ≈;
     # force UTF-8 so the printed Markdown matches what we write to disk.
@@ -244,6 +382,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=None, help="served depth (default RETRIEVAL_TOP_K)")
     parser.add_argument("--k-sweep", type=str, default="1,3,5,10", help="comma-separated k values (retrieval)")
     parser.add_argument("--judge", action="store_true", help="run generation eval (faithfulness + answer-relevance) instead of retrieval")
+    parser.add_argument("--sweep", action="store_true", help="run the Ship H multi-config OFAT sweep (builds throwaway per-config indexes)")
     parser.add_argument("--gen-sample", type=int, default=None, help="cap in-domain queries judged (generation only)")
     parser.add_argument("--testset", type=str, default=TESTSET_PATH)
     parser.add_argument("--out", type=str, default=None, help="output dir (default <OUTPUT_DIR>/eval)")
@@ -257,11 +396,15 @@ def main() -> None:
         logger.error("Test set %s is empty — nothing to evaluate.", args.testset)
         return
 
+    os.makedirs(out_dir, exist_ok=True)
+    if args.sweep:
+        _run_sweep(args, settings, testset, out_dir)
+        return
+
     components = _build_components(settings)
     if components is None:
         return
 
-    os.makedirs(out_dir, exist_ok=True)
     if args.judge:
         _run_generation(args, settings, testset, out_dir, components)
     else:

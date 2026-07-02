@@ -34,8 +34,35 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from src.config import Settings
-from src.evaluation.harness import EvalReport, GenerationReport
+from src.evaluation.harness import (
+    EvalReport,
+    GenerationReport,
+    evaluate_generation,
+    evaluate_retrieval,
+)
 from src.evaluation.testset import TestQuery
+from src.rag.chunker import chunk_article
+from src.rag.qa import QAEngine
+from src.rag.retriever import Retriever
+from src.storage.vector_store import VectorStore
+
+# gpt-4o-mini list price (USD per 1M tokens) — mirrors evaluate.py._est_cost so the
+# sweep stays self-contained (importing the CLI module would be circular).
+GPT_4O_MINI_INPUT_PER_1M = 0.15
+GPT_4O_MINI_OUTPUT_PER_1M = 0.60
+
+
+def _est_cost(prompt_tokens: int, completion_tokens: int) -> float:
+    return (
+        prompt_tokens / 1e6 * GPT_4O_MINI_INPUT_PER_1M
+        + completion_tokens / 1e6 * GPT_4O_MINI_OUTPUT_PER_1M
+    )
+
+
+def _model_slug(embedding_model: str) -> str:
+    """Filesystem-safe short name: drop any 'org/' prefix, e.g.
+    'sentence-transformers/all-MiniLM-L6-v2' -> 'all-MiniLM-L6-v2'."""
+    return embedding_model.rsplit("/", 1)[-1]
 
 # Baseline = the served default config (bold values in the plan's OFAT grid).
 BASELINE_CHUNK_SIZE = 256
@@ -68,13 +95,14 @@ class SweepConfig:
 
         TODO: return a filesystem-safe slug, e.g. f"chunk{chunk_size}_{model_slug}".
         """
-        raise NotImplementedError
+        return f"chunk{self.chunk_size}_{_model_slug(self.embedding_model)}"
 
     @property
     def label(self) -> str:
         """Human-readable row label for the comparison table, e.g.
         "chunk256 / top_k5 / MiniLM". Includes top_k (unlike index_slug)."""
-        raise NotImplementedError
+        model = "MiniLM" if "minilm" in self.embedding_model.lower() else _model_slug(self.embedding_model)
+        return f"chunk{self.chunk_size} / top_k{self.top_k} / {model}"
 
 
 def build_grid(
@@ -98,7 +126,32 @@ def build_grid(
     TODO: build the deduped list of SweepConfig. Order it so build_index runs once
     per index_slug (group by chunk_size).
     """
-    raise NotImplementedError
+    # Overlap scales proportionally with chunk_size off the baseline (38 tok @ 256 ≈
+    # 15%), so the 128/512 indexes keep the same ~15% boundary feel rather than
+    # inheriting the baseline's absolute 38.
+    def _overlap(chunk_size: int) -> int:
+        return round(overlap * chunk_size / BASELINE_CHUNK_SIZE)
+
+    # OFAT: vary chunk_size at the baseline top_k, then top_k at the baseline chunk.
+    pairs = [(cs, BASELINE_TOP_K) for cs in chunk_sizes]
+    pairs += [(BASELINE_CHUNK_SIZE, tk) for tk in top_ks]
+
+    seen = set()
+    configs: List[SweepConfig] = []
+    for cs, tk in pairs:
+        cfg = SweepConfig(
+            chunk_size=cs,
+            overlap=_overlap(cs),
+            embedding_model=embedding_model,
+            top_k=tk,
+        )
+        if cfg not in seen:  # the baseline (256, top_k5) lands in both arms — emit once
+            seen.add(cfg)
+            configs.append(cfg)
+
+    # Group by chunk_size so build_index runs once per index_slug; top_k is secondary.
+    configs.sort(key=lambda c: (c.chunk_size, c.top_k))
+    return configs
 
 
 def build_index(
@@ -141,7 +194,42 @@ def build_index(
 
     TODO: implement; never write outside sweep_root.
     """
-    raise NotImplementedError
+    persist_dir = os.path.join(sweep_root, config.index_slug)
+    os.makedirs(persist_dir, exist_ok=True)
+
+    # Isolate ChromaDB to the throwaway dir — canonical data/chroma/ is never opened.
+    cfg_settings = settings.model_copy(update={"CHROMA_PERSIST_DIR": persist_dir})
+    vstore = VectorStore(cfg_settings)
+
+    # Resumable: a populated collection means this (chunk_size, model) index already
+    # exists from a prior run — reuse it instead of re-chunking + re-embedding.
+    if vstore.financial_news_collection.count() > 0:
+        return Retriever(embedder, vstore)
+
+    chunks: List[dict] = []
+    for row in db.get_all_articles():  # read-only ORM rows over the whole corpus
+        article = {
+            "id": row.id,
+            "content": row.content,
+            "title": row.title,
+            "source": row.source,
+            "url": row.url,
+            "published_at": row.published_at,
+        }
+        chunks.extend(
+            chunk_article(
+                article,
+                embedder.model.tokenizer,
+                config.chunk_size,
+                config.overlap,
+            )
+        )
+
+    if chunks:
+        embeddings = embedder.generate_embeddings([c["text"] for c in chunks]).tolist()
+        vstore.add_chunks(chunks, embeddings)
+
+    return Retriever(embedder, vstore)
 
 
 @dataclass
@@ -195,7 +283,53 @@ def run_sweep(
 
     TODO: implement the grouped loop; return the rows.
     """
-    raise NotImplementedError
+    if configs is None:
+        configs = build_grid()
+
+    # Group by index identity, preserving build_grid's order. Each group shares one
+    # physical index; its configs differ only in the free top_k knob.
+    groups: Dict[str, List[SweepConfig]] = {}
+    for c in configs:
+        groups.setdefault(c.index_slug, []).append(c)
+
+    rows: List[SweepRow] = []
+    for cfgs in groups.values():
+        retriever = build_index(cfgs[0], settings, db, embedder)  # ONCE per slug
+        qa_engine = QAEngine(retriever, llm)
+
+        # k-sweep every top_k this index needs in a single retrieval pass.
+        k_values = sorted({c.top_k for c in cfgs})
+        retr_report = evaluate_retrieval(
+            testset, retriever, qa_engine, top_k=BASELINE_TOP_K, k_values=k_values
+        )
+
+        for config in cfgs:  # innermost, FREE: query-time top_k only
+            gen_report = evaluate_generation(
+                testset, retriever, qa_engine, llm, embedder, config.top_k, cache
+            )
+            rows.append(_build_row(config, retr_report, gen_report))
+
+    return rows
+
+
+def _build_row(
+    config: SweepConfig, retr_report: EvalReport, gen_report: GenerationReport
+) -> SweepRow:
+    """Pull the scalar fields for `config.top_k` out of the two reports."""
+    pk = retr_report.per_k_means.get(config.top_k, {})
+    return SweepRow(
+        config=config,
+        retrieval=retr_report,
+        generation=gen_report,
+        precision=pk.get("precision"),
+        recall=pk.get("recall"),
+        hit_rate=pk.get("hit"),
+        mrr=retr_report.mean_mrr,
+        faithfulness=gen_report.mean_faithfulness,
+        answer_relevance=gen_report.mean_answer_relevance,
+        latency_p50_ms=retr_report.latency_p50_ms,
+        est_cost_usd=_est_cost(gen_report.prompt_tokens, gen_report.completion_tokens),
+    )
 
 
 def rank_rows(rows: List[SweepRow]) -> List[SweepRow]:
@@ -209,4 +343,21 @@ def rank_rows(rows: List[SweepRow]) -> List[SweepRow]:
 
     TODO: implement the sort; decide + document the tie threshold.
     """
-    raise NotImplementedError
+    # Tie threshold = round to 2 decimals (~0.01 band) on the generation metrics, so
+    # differences inside judge variance don't decide the ranking — they fall through
+    # to the (exact) retrieval tie-breakers. None ranks worst.
+    def _bucket(x: Optional[float]) -> float:
+        return round(x, 2) if x is not None else -1.0
+
+    def _raw(x: Optional[float]) -> float:
+        return x if x is not None else -1.0
+
+    return sorted(
+        rows,
+        key=lambda r: (
+            -_bucket(r.faithfulness),
+            -_bucket(r.answer_relevance),
+            -_raw(r.hit_rate),
+            -_raw(r.mrr),
+        ),
+    )
